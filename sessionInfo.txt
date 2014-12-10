@@ -10,13 +10,13 @@ attached base packages:
 
 other attached packages:
 [1] survival_2.37-7  Lahman_3.0-1     ggplot2_1.0.0    dplyr_0.3.0.9000
-[5] broom_0.3.4.9000 knitr_1.7.1     
+[5] broom_0.3.4      knitr_1.8       
 
 loaded via a namespace (and not attached):
  [1] assertthat_0.1   codetools_0.2-9  colorspace_1.2-4 DBI_0.3.1       
  [5] digest_0.6.4     evaluate_0.5.5   formatR_1.0      grid_3.1.1      
  [9] gtable_0.1.2     labeling_0.3     lazyeval_0.1.9   magrittr_1.0.1  
-[13] MASS_7.3-35      munsell_0.4.2    parallel_3.1.1   plyr_1.8.1      
-[17] proto_0.3-10     psych_1.4.8.11   R6_2.0           Rcpp_0.11.3     
-[21] reshape2_1.4     rstudioapi_0.1   scales_0.2.4     stringr_0.6.2   
+[13] MASS_7.3-35      munsell_0.4.2    packrat_0.4.1-1  parallel_3.1.1  
+[17] plyr_1.8.1       proto_0.3-10     psych_1.4.8.11   R6_2.0          
+[21] Rcpp_0.11.3      reshape2_1.4     scales_0.2.4     stringr_0.6.2   
 [25] tidyr_0.1.0.9000 tools_3.1.1     

@@ -10,7 +10,7 @@
 
 \maketitle
 
-<<echo = FALSE>>=
+<<echo = FALSE, warning = FALSE>>=
 # setup for RJournal
 library(knitr)
 opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
