@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+
+*.aux
+*synctex.gz*
+*.log
+*.out
+*.bbl
+*.blg
+*.brf
+
+cache
+figure

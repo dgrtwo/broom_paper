@@ -1,0 +1,793 @@
+% !TeX root = RJwrapper.tex
+
+% A reproducible version of this manuscript, along with instructions for
+% its reproduction, can be found at
+
+% https://github.com/dgrtwo/broom_paper
+
+\title{\pkg{broom}: An {R} Package for Converting Statistical Analysis Objects Into Tidy Data Frames}
+\author{by David Robinson}
+
+\maketitle
+
+<<echo = FALSE>>=
+# setup for RJournal
+library(knitr)
+opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+               fig.width = 6, fig.height = 6,
+               out.width = "3in", out.height = "3in")
+
+wrap_example = function(x, options) {
+    paste0("\n\\begin{example}\n", x, "\n\\end{example}\n")
+}
+
+knit_hooks$set(source = wrap_example,
+               output = wrap_example,
+               chunk = function(x, options) x,
+               plot = hook_plot_tex)
+@
+
+\abstract{
+The concept of "tidy data" offers a powerful framework for structuring data to ease manipulation, modeling and visualization. However, most R functions, both those built-in and those found in third-party packages, produce output that is not tidy, and that is therefore difficult to reshape, recombine, and otherwise manipulate. Here I introduce the \CRANpkg{broom} package, which turns the output of model objects into tidy data frames that are suited to further analysis, manipulation, and visualization with input-tidy tools. \pkg{broom} defines the \code{tidy}, \code{augment}, and \code{glance} generics, which arrange a model into three levels of tidy output respectively: the component level, the observation level, and the model level. I provide examples to demonstrate how these generics work with tidy tools to allow analysis and modeling of data that is divided into subsets, to recombine results from bootstrap replicates, and to perform simulations that investigate the effect of varying input parameters.}
+
+\section{Introduction}
+
+A common observation is that more of the data scientist's time is occupied with data cleaning, manipulation, and "munging" than it is with actual statistical modeling \citep{Rahm:2000tl,Dasu:2003ul}. Thus, the development of tools for manipulating and transforming data is necessary for efficient and effective data analysis. One important choice for a data scientist working in R is how data should be structured, particularly the choice of dividing observations across rows, columns, and multiple tables.
+
+The concept of "tidy data," introduced by \citet{Wickham:2014vp}, offers a set of guidelines for organizing data in order to facilitate statistical analysis and visualization. In short, data can be described as "tidy" if it is represented in a table following three rules:
+
+\begin{itemize}
+\item Each variable forms one column
+\item Each observation forms one row
+\item Each type of observational unit forms one table
+\end{itemize}
+
+This framework makes it easy for analysts to reshape, combine, group and otherwise manipulate data. Packages such as \CRANpkg{ggplot2}, \CRANpkg{dplyr}, and many built-in R modeling and plotting functions require the input to be in a tidy form, so keeping the data in this form allows multiple tools to be used in sequence in a seamless analysis pipeline \citep{package:ggplot2,package:dplyr}.
+
+Tools are classified as "messy-output" if their output does not fit into this framework. Unfortunately, the majority of R modeling tools, both from the built-in \pkg{stats} package and those in common third party packages, are messy-output. This means the data analyst must tidy not only the original data, but the results at each intermediate stage of an analysis. \citet{Wickham:2014vp} describes this problem succinctly:
+
+\begin{quote}
+While model inputs usually require tidy inputs, such attention to detail doesn't carry over to model outputs. Outputs such as predictions and estimated coefficients aren't always tidy. For example, in R, the default representation of model coefficients is not tidy because it does not have an explicit variable that records the variable name for each estimate, they are instead recorded as row names. In R, row names must be unique, so combining coefficients from many models (e.g., from bootstrap resamples, or subgroups) requires workarounds to avoid losing important information. This knocks you out of the flow of analysis and makes it harder to combine the results from multiple models. I'm not currently aware of any packages that resolve this problem.
+\end{quote}
+
+The \pkg{broom} package is an attempt to solve this issue, by bridging the gap from untidy outputs of predictions and estimations to create tidy data that is easy to manipulate with standard tools. It centers around three S3 methods, \code{tidy}, \code{augment}, and \code{glance}, that each take an object produced by R statistical functions (such as \code{lm}, \code{t.test}, and \code{nls}) or by popular third-party packages (such as \CRANpkg{glmnet}, \CRANpkg{survival}, \CRANpkg{lme4}, and \CRANpkg{multcomp}) and convert it into a tidy data frame without rownames \citep{Friedman:2010wm,package:survival,package:lme4,package:multcomp}. These outputs can then be used with input-tidy tools such as \pkg{dplyr} or \pkg{ggplot2}, or downstream statistical tests.
+
+\pkg{broom} should be distinguished from packages such as \CRANpkg{reshape2} and \CRANpkg{tidyr}, which rearrange and reshape data frames into different forms \citep{package:reshape2,package:tidyr}. Those packages perform essential tasks in tidy data analysis but focus on manipulating data frames in one specific format into another. In contrast, \pkg{broom} is designed to take data that is \emph{not} in a data frame (sometimes not anywhere close) and convert it to a tidy data frame.
+
+\section{Three methods of tidying objects}
+
+As a simple demonstration of tidying a statistical object, consider a linear regression on the built-in \code{mtcars} dataset, predicting the fuel efficiency of cars (\code{mpg}, measured in miles-per-gallon) based on the weight of the cars (\code{wt}, measured in thousands of pounds) and the speed/acceleration (\code{qsec}, the time in seconds to drive a quarter of a mile).
+
+<<mtcars_fit>>=
+fit <- lm(mpg ~ wt + qsec, data = mtcars)
+summary(fit)
+@
+
+The summary of this regression shows that it contains coefficient-level information, including the estimate, standard error, and p-value, about each of the intercept, \code{wt}, and \code{qsec} terms. The \code{fit} object \emph{also} contains observation-level information, such as the residuals (accessed by \code{residuals(fit)}) and fitted values (accessed by \code{fitted(fit)}). Finally, it contains model-level information in the form of $R^2$, adjusted $R^2$, an F statistic, and a p-value for the whole dataset. As previously observed by \citet{Wickham:2007}, values computed at each of these three levels have different dimensionalities and observations: there is no natural way to combine a calculation of $R^2$ with the estimates of coefficient values, or with a vector of residuals, in a single data frame. In the tidy data terminology, each level forms a separate "observational unit" and therefore deserves its own table. To generate these three separate tidy data frames, \pkg{broom} provides three S3 methods that do three distinct kinds of tidying: \code{tidy}, \code{augment} and \code{glance}.
+
+\code{tidy} constructs a data frame that summarizes the model's statistical components, which we refer to as the \dfn{component level}. In a regression such as the above it may refer to coefficient estimates, p-values, and standard errors for each term in a regression. The \code{tidy} generic is flexible- in other models it could represent per-cluster information in clustering applications, or per-test information for multiple comparison functions.
+
+<<dependson = "mtcars_fit">>=
+library(broom)
+tidy(fit)
+@
+
+\code{augment} add columns to the original data that was modeled, thus working at the \dfn{observation level}. This includes predictions, residuals and prediction standard errors in a regression, and can represent cluster assignments or classifications in other applications. By convention, each new column starts with \samp{.} to ensure it does not conflict with existing columns. To ensure that the output is tidy and can be recombined, rownames in the original data, if present, are added as a column called \code{.rownames}.
+
+<<dependson = "mtcars_fit">>=
+head(augment(fit))
+@
+
+Finally, \code{glance} constructs a concise one-row summary of the \dfn{model level} values. In a regression this typically contains values such as $R^2$, adjusted $R^2$, residual standard error, Akaike Information Criterion (AIC), or deviance. In other applications it can include calculations such as cross validation accuracy or prediction error that are computed once for the entire model.
+
+<<dependson = "mtcars_fit">>=
+glance(fit)
+@
+
+%Statistical models are complex objects: they often contain information about multiple levels of an analysis. For instance, consider the object produced by a regression of $n$ observations with $p$ predictors. %\citet{Wickham:2007} notes that such a model contains computed statistics at the following levels:
+
+% \begin{itemize}
+% \item \textbf{coefficient level}: : $p$ values per model
+% \item \textbf{residual level}: fitted value, residual, Cook's standard deviation: $n$ values per model
+% \item \textbf{model level}: $R^2$, adjusted $R^2$, F-statistic and p-value, residual standard error: 1 value per model
+% \end{itemize}
+
+
+These three methods appear across many analyses; indeed, the fact that these three levels must be combined into a single S3 object is a common reason that model outputs are not tidy. Importantly, some model objects may have only one or two of these methods defined. (For example, there is no sense in which a Student's T test or correlation test generates information about each observation, and therefore no \code{augment} method exists). Table \ref{tab:tidiers} shows the tidying methods that are implemented for each statistical object that \pkg{broom} can tidy.
+
+% \subsection{Conventions}
+% 
+% In order to maintain consistency, we attempt to follow some conventions regarding the structure of returned data. This lets users know what to expect from tidy output and makes it easy to recombine results across different kinds of analyses.
+% 
+% \begin{itemize}
+% \item The output of the \code{tidy}, \code{augment} and \code{glance} functions is always a data frame.
+% \item The output never has rownames. This ensures that you can combine it with other tidy outputs without fear of losing information (since rownames in R cannot contain duplicates).
+% \item Some column names are kept consistent, so that they can be combined across different models and so the user knows what to expect. The examples below are not all the possible column names, nor will all tidy output contain all or even any of these columns.
+% \end{itemize}
+% 
+% \code{tidy} methods are the most flexible of the generics. Each row in a \code{tidy} output typically represents a well-defined component of the model, such as one coefficient in a regression, one statistical test in a multiple comparisons analysis, or one cluster or class in a clustering or classification algorithm. This meaning varies across model objects but is usually self-evident from a simple examination of the object to be tidied. The one thing each row cannot represent is a row in the initial data (for that, use the \code{augment} method).
+% 
+% Common column names of \code{tidy} outputs include:
+% 
+% \begin{description}
+% \item[term] the term in a regression or model that is being estimated
+% \item[p.value]  this spelling was chosen (over common alternatives such as \code{pvalue}, \code{PValue}, or \code{pval}) to be consistent with functions in R's \code{stats} package
+% \item[statistic] a test statistic, usually the one used to compute the p-value. Combining these across many sub-groups is a reliable way to perform bootstrap or permutation testing
+% \item[estimate] estimate of an effect size, slope, or other value
+% \item[std.error] standard error of the estimate
+% \item[conf.low] the low end of a confidence interval on the \code{estimate}
+% \item[conf.high] the high end of a confidence interval on the \code{estimate}
+% \item[df] degrees of freedom
+% \end{description}
+% 
+% The \code{augment} generic adds columns to the original data, which means each row in an \code{augment} output matches the corresponding row in the data. \code{augment} typically takes two arguments: \code{x} (the object) and \code{data} (the original data). If the \code{data} argument is missing, \code{augment} attempts to reconstruct the data from the model, which may or may not be possible. Newly added column names begin with \samp{.} to avoid overwriting columns in the original data, and if the original data contained rownames, \code{augment} turns them into a column called \code{.rownames}.
+% 
+% Common column names of \code{augment} output include:
+% 
+% \begin{description}
+%     \item[.fitted] the predicted values, typically calculated from the model with \code{fitted}.
+%     \item[.resid] prediction residuals, typically calculated from the model with \code{residuals}
+%     \item[.cluster] cluster assignments
+% \end{description}
+% 
+% Finally, the output from \code{glance} is always a one-row data frame. The only exception is that \code{glance(NULL)} returns an empty data frame (this is useful in combination with \pkg{dplyr}'s \code{failwith}, so that models that raise errors can be discarded from the output). Common column names include:
+% 
+% \begin{description}
+%     \item[r.squared] the fraction of variance explained by the model
+%     \item[adj.r.squared] $R^2$ adjusted based on the degrees of freedom
+%     \item[sigma] the square root of the estimated variance of the residuals
+%     \item[df.residual] number of residual degrees of freedom
+%     \item[logLik] the log-likelihood of the data given the model
+%     \item[AIC] Akaike's Information Criterion, an assessment of a model fit typically calculated by \code{AIC}
+%     \item[BIC] Bayesian Information Criterion, an assessment of a model fit typically calculated by \code{BIC}
+% \end{description}
+
+\begin{table}[ht]
+\centering
+
+\begin{tabular}{|c|p{7cm}|ccc|}
+  \hline
+package & class & tidy & augment & glance \\ 
+  \hline
+\pkg{base} & data.frame & X &   & X \\ 
+   \cline{2-5}
+   & table & X &  &  \\ 
+   \hline
+\pkg{stats} & anova, aov, density, ftable, manova, pairwise.htest, spec, ts, TukeyHSD & X &  &  \\ 
+   \cline{2-5}
+   & kmeans, lm, nls & X & X & X \\ 
+   \cline{2-5}
+   & smooth.spline &  & X & X \\ 
+   \cline{2-5}
+   & Arima, htest & X &  & X \\ 
+   \cline{2-5}
+   & glm &  &  & X \\ 
+   \hline
+\pkg{glmnet} & cv.glmnet, glmnet & X &  & X \\ 
+   \hline
+\pkg{lfe} & felm & X & X & X \\ 
+   \hline
+\pkg{lme4} & mer, merMod & X & X & X \\ 
+   \hline
+\pkg{maps} & map & X &  &  \\ 
+   \hline
+\pkg{MASS} & ridgelm & X &  & X \\ 
+   \hline
+\pkg{multcomp} & cld, confint.glht, glht, summary.glht & X &  &  \\ 
+   \hline
+\pkg{sp} & Line, Lines, Polygon, Polygons, SpatialLinesDataFrame, SpatialPolygons, SpatialPolygonsDataFrame & X &  &  \\ 
+   \hline
+\pkg{survival} & aareg, cch, pyears, survexp, survfit & X &  & X \\ 
+   \cline{2-5}
+   & coxph, survreg & X & X & X \\ 
+   \hline
+\pkg{zoo} & zoo & X &  &  \\ 
+   \hline
+\end{tabular}
+
+\caption{The statistical objects for which \code{tidy}, \code{augment}, and \code{glance} methods are implemented in \pkg{broom} (version 0.3.4). \label{tab:tidiers}}
+
+\end{table}
+
+\subsection{Common attributes of messy outputs}
+
+Extracting these three levels of tidied contents from a statistical object is not a trivial process, since they are often stored in a messy format that is not conducive to further analysis. The process of tidying a model output must be tailored to each object, since each model object is messy in its own way, but one can recognize some common features of messy-output models. Many are the same issues described in \citet{Wickham:2014vp} as features of messy datasets, such as having variables stored in column names. The following tendencies, however, are more specific to model outputs:
+
+\begin{itemize}
+\item \emph{Relevant information is stored in rownames.} Examples include the coefficient names in a regression coefficient matrix or ANOVA table. Since R does not allow row names to be duplicated, this prevents one from combining the results of multiple analyses or bootstrap replications.
+\item \emph{Column names are inconsistent and inconvenient.} For instance, p-values for each coefficient produced by the \code{summary.lm} function are stored in a column named \code{Pr(>|t|)}. Besides being incomparable to other model outputs that use \code{p.value}, \code{pvalue}, or just \code{p}, this column name is difficult to work with due to the use of punctuation; for instance, it cannot easily be extracted using \samp{\$} or passed to \code{aes} in a \pkg{ggplot2} call.
+\item \emph{Information is computed by downstream functions.} Many models need to be run through additional processing steps, often the \texttt{summary} method, to produce the statistical information desired. The steps required can be inconsistent even between similar models. For example, the \code{anova} function produces an ANOVA table immediately, while an object from \code{aov} must be run through \code{summary.aov} to produce the table.
+\item \emph{Information is printed rather than returned.} Some packages and functions place relevant calculations into the \code{print} method, where they are displayed using \code{cat}. An example is the calculation of a p-value from an F-statistic in \code{print.summary.lm}. This requires either examining the source of the \code{print} method to extract the code of interest or capturing and parsing the printed output.
+\item \emph{Vectors are stored separately rather than combined in a table.} For example, residuals and fitted values are both returned by many model outputs, but are accessed with the \texttt{residuals} and \texttt{fitted} generics. In other objects multiple vectors of the same length are included as separate elements in a named list. This requires recombining these vectors into a data frame to use them with input-tidy tools.
+\end{itemize}
+
+Each of these obstacles can be individually overcome by the knowledgeable programmer, but in combination they serve as a massive inconvenience. Time spent reforming these model outputs into the desired structure breaks the natural flow of analysis and takes attention away from examining and questioning the data. They further invite inconsistency, where different analysts will approach the same task in very different ways, which makes it time-consuming to understand and adapt shared code. Defining a standard "tidy form" of any model output, and collecting tools for constructing such a form from an R object, makes analyses easy, efficient, and consistent.
+
+\section{Case studies}
+
+Here I show how \pkg{broom} can be widely useful across data science applications. I give three examples: combining regressions performed on subgroups of data, a demonstration of bootstrapping, and a simulation of k-means clustering. Each example highlights some of the advantages of keeping model outputs tidy.
+
+These examples assume familiarity with the \pkg{dplyr} and \pkg{ggplot2} packages, since they are powerful implementations of tidy tools (though it is certainly possible to take advantage of \pkg{broom} without these packages). Note that in contrast to these packages, \pkg{broom} functions take up only a small part of these examples, which is by design. \pkg{broom} is meant to serve as a simple bridge between the modeling tools provided by R and the downstream analyses enabled by tidy tools, requiring minimal experience with or configuration of the package.
+
+\subsection{Split-apply-combine using \pkg{broom} and \pkg{dplyr}}
+
+\label{sec:split_apply_combine}
+
+The "split-apply-combine" pattern, where a dataset is broken down into subgroups for some analysis to be performed before being recombined, is a common task in data analysis \citep{Wickham:2011}. \pkg{broom} eases the application of this pattern to a wide range of problems, since it converts many analysis outputs to a consistently-structured data frame that can be recombined. Here we demonstrate examples of using \pkg{broom} to perform the split-apply-combine pattern, first in a simple regression on the \code{mtcars} dataset, then in a more complex analysis of baseball statistics.
+
+We earlier showed an example of tidying a regression on the \code{mtcars} dataset.
+
+<<>>=
+regression <- lm(mpg ~ wt + qsec, data = mtcars)
+tidy(regression, conf.int = TRUE)
+@
+
+Suppose we wished to perform this analysis separately for each subset of the data: specifically, once for cars with automatic transmissions and once for cars with manual transmissions. \pkg{dplyr}'s \code{group\_by} and \code{do} functions provide a straightforward way to perform an analysis on each subgroup, but only if the output of each individual analysis takes the form of a data frame. \pkg{broom} accomplishes this goal by converting each model object into a tidy format.
+
+<<mtcars_by_cyl>>=
+library(dplyr)
+regressions <- mtcars %>% group_by(am) %>%
+    do(tidy(lm(mpg ~ wt + qsec, data = .), conf.int = TRUE))
+regressions
+@
+
+This shows the estimated coefficients of regressions within automatic and manual cars, recombined. This makes it easy to perform downstream visualizations and analyses on these regression results. For example, we could use \pkg{ggplot2} to create a coefficient plot that distinguished between the two types of transmission:
+
+<<coefplot, dependson = "mtcars_by_cyl">>=
+library(ggplot2)
+regressions %>% filter(term != "(Intercept)") %>%
+    ggplot(aes(x = estimate, y = term, color = factor(am), group = am)) +
+    geom_point() + geom_errorbarh(aes(xmin = conf.low, xmax = conf.high)) +
+    geom_vline()
+@
+
+The \textbf{do} function also allows one to construct regressions once and save them as a column in a rowwise table, so that we can perform multiple operations on them.
+
+<<mtcars_by_cyl_regressions>>=
+regressions <- mtcars %>% group_by(am) %>%
+    do(mod = lm(mpg ~ wt + qsec, .))
+regressions
+@
+
+This is useful if we want to tidy, augment and glance each regression separately. Indeed, \pkg{broom} includes a shortcut for this purpose, where \code{\%>\% tidy(`column`)} on a rowwise table will perform a tidying operation on each object in that column:
+
+<<dependson = "mtcars_by_cyl_regressions">>=
+regressions %>% tidy(mod, conf.int = TRUE)
+regressions %>% glance(mod)
+@
+
+This split-apply-combine pattern appears in a variety of contexts. One might perform analyses for each gene in an organism, within each county or region in a country, or for each stock in a financial dataset. Here I consider another example, where we investigate how baseball players' batting averages are reflected in their salaries, using data from the \CRANpkg{Lahman} package \citep{package:Lahman}.
+
+<<lahman>>=
+library(Lahman)
+merged <- Batting %>% tbl_df() %>%
+    inner_join(Salaries) %>%
+    mutate(average = H / AB) %>%
+    filter(salary > 0, AB >= 50, !(playerID %in% Pitching$playerID))
+merged
+@
+
+Here I've used \pkg{dplyr} to perform a few filtering and processing operations to set up the analysis. I merged Lahman's \code{Batting} dataset, which contains statistics on batting performance per player per season, with player salary information. I computed each player's batting average in each season: the fraction of times at bat ("AB") that led to a hit ("H"). I filtered for cases where the player had a nonzero salary, was at bat at least 50 times, and was not a pitcher (pitchers in baseball are typically not paid based on their batting ability).
+
+Suppose we wish to investigate how players' salaries are related to their batting averages. We could start by performing a single linear regression predicting the log of salary based on batting average, including the year as a second predictor. A scatterplot shows that this relationship is plausible:
+
+\begin{center}
+<<lahman_plot, dependson = "lahman">>=
+library(ggplot2)
+ggplot(merged, aes(average, salary, color = yearID)) + geom_point() +
+    scale_y_log10()
+@
+\end{center}
+
+<<dependson = "lahman">>=
+salary_fit <- lm(log10(salary) ~ average + yearID, merged)
+summary(salary_fit)
+@
+
+This finds both a player's batting average and the year to be positively related to salary. What if we hypothesize that different teams place different amounts of emphasis on batting average for determining salary? We may be interested in performing the regression within each team. This can be done using \code{group\_by} and \code{do}.
+
+<<regressions, dependson = "lahman">>=
+team_regressions <- merged %>% group_by(teamID) %>%
+    do(tidy(lm(log10(salary) ~ average + yearID, .), conf.int = TRUE))
+team_regressions
+@
+
+With the regressions in this tidied format, we can examine and visualize the effect size estimates and confidence interval across all teams:
+
+\begin{center}
+<<regressions_plot, dependson = "regressions">>=
+coefs <- team_regressions %>% ungroup() %>%
+    filter(term == "average") %>%
+    mutate(teamID = reorder(teamID, estimate))
+ggplot(coefs, aes(x = estimate, y = teamID)) + geom_point() +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high)) +
+    geom_vline(color = "red")
+@
+\end{center}
+
+Any analysis that has a tidying method can easily be performed within each team. For example, rather than performing a linear regression, we could find the Spearman correlation between salary and batting average within each team:
+
+<<>>=
+cors <- merged %>% group_by(teamID) %>%
+    do(tidy(cor.test(.$salary, .$average, method = "spearman"))) %>%
+    ungroup %>% arrange(estimate)
+tail(cors, 3)
+@
+
+One could just as easily perform ANOVA, time series analyses, or nonlinear regressions within each subgroup. Similarly, one could perform analyses while grouping by league, by year, or by player, rather than by team. These analyses of subgroups are made possible by \pkg{broom}'s tidying methods, since they allow the model outputs to be recombined into a new tidy output.
+
+% As an illustrative example I demonstrate an analysis on the gene expression dataset of \citet{Brauer:2008jn}, where I perform a linear regression on each individual gene before combining them into a tidy form. This dataset contains measurements of mRNA abundance levels of each of the $\sim 5200$ genes in \emph{Sacchromyces cerevisiae}, or baker's yeast, in varying conditions to examine the effect of growth rate on each gene's expression. The yeast were grown using one of six compounds as the limiting nutrient, each of which is coded by a letter: glucose (G), leucine (L), ammonia (N), phosphate (P), sulfate (S), and uracil (U). For each of these nutrients, the growth rate was varied between a dilution rate of 0.05 (slow) to .3 (fast).
+% 
+% <<brauer_data>>=
+% brauer <- read.delim("input/DataSet1.tds")
+% head(brauer, 3)
+% @
+% 
+% The framework of tidy data requires that each combination of a gene and sample has its own row, and that each attribute of a gene has its own column. As with most "naturally occuring" datasets, the supplementary data provided by Brauer et al 2008 does not follow these standards. However, it can be easily tidied using the \CRANpkg{tidyr} and \CRANpkg{dplyr} packages.
+% 
+% <<brauer_tidied, dependson = "brauer_data">>=
+% library(dplyr)
+% library(tidyr)
+% brauer_tidied <- brauer %>% na.omit() %>%
+%     separate(NAME, c("name", "BP", "MF", "gene", "ID"), sep = " \\|\\| ") %>%
+%     filter(gene != "") %>%
+%     gather(condition, expression, G0.05:U0.3) %>%
+%     separate(condition, c("nutrient", "rate"), 1, convert = TRUE)
+% 
+% head(brauer_tidied, 3)
+% @
+% 
+% Following the guidelines for tidy data, we first split up the YORF column, which contains multiple attributes of each gene, into multiple columns. Since the column names of the form \texttt{G0.05} are in fact storing observations rather than variable names, we gather them into a column, which we split into \code{nutrient} and \code{rate}. This produces a useful tidy output that makes visualization and modeling straightforward. For example, we can filter for the genes in a single biological process (using the \code{BP} column) and graph its expression as a function of the growth rate.
+% 
+% \begin{center}
+% <<brauer_graph, dependson = "brauer_tidied">>=
+% library(ggplot2)
+% brauer_tidied %>% filter(BP == "leucine biosynthesis") %>%
+%     ggplot(aes(rate, expression, color = nutrient)) + geom_line() +
+%     facet_wrap(~ name)
+% @
+% \end{center}
+% 
+% Up until this stage we have succeeded in working entirely with tidy data tools. However, suppose we wish to perform a linear regression within each combination of gene and nutrient. This regression would produce values for each gene, including coefficients, standard errors, and t-statistics, and we would like to recombine them in a way that includes information from each gene in a large tidy dataset. The \code{tidy.lm} method, combined with \code{do} from \pkg{dplyr}, makes this easy.
+% 
+% <<brauer_regressions, dependson = "brauer_tidied">>=
+% library(broom)
+% regressions <- brauer_tidied %>%
+%     group_by(gene, nutrient) %>%
+%     do(tidy(lm(expression ~ rate, .)))
+% head(regressions)
+% @
+% 
+% Having the analyses, and not just the original data, in this tidied form allows us to construct downstream plots and analyses using standard tidy tools. We can use \pkg{dplyr}'s \code{filter} and \code{mutate} data manipulation operations to filter out the intercept term and perform Benjamini-Hochberg FDR control within each set of p-values \citep{benjamini1995cfd}:
+% 
+% <<brauer_process, dependson = "brauer_regressions">>=
+% coefs <- regressions %>%
+%     filter(term != "(Intercept)") %>% select(-term) %>%
+%     group_by(nutrient) %>%
+%     mutate(p.adjusted = p.adjust(p.value, method = "BH"))
+% @
+% 
+% After this processing, we can use \pkg{dplyr}'s \code{summarize} to show the number of genes found to have a statistically significant trend within each limiting nutrient:
+% 
+% <<brauer_sig_summary, dependson = "brauer_process", results = "asis">>=
+% coefs %>% summarize(significant = sum(p.adjusted < .05)) %>% knitr::kable()
+% @
+% 
+% This tidied model output is friendly to many visualizations. For instance, we can construct a p-value histogram, a useful tool for characterizing behavior across many hypothesis tests (see e.g. \citet{Storey:2003b}).
+% 
+% \begin{center}
+% <<brauer_histogram, dependson = "brauer_process">>=
+% ggplot(coefs, aes(p.value)) + geom_histogram(binwidth = .05) +
+%     facet_wrap(~ nutrient)
+% @
+% \end{center}
+% 
+% We could also create a volcano plot, which compares the estimated effect size (slope) of each hypothesis to its significance (p-value) \citep{Allison:2006wz}.
+% 
+% \begin{center}
+% <<brauer_volcano, dependson = "brauer_histogram">>=
+% ggplot(coefs, aes(estimate, p.value, color = p.adjusted < .05)) +
+%     geom_point() + scale_y_log10() + facet_wrap(~ nutrient)
+% @
+% \end{center}
+% 
+% For a more complicated visualization that examines the details of specific genes, one could sort genes by their p-value using \pkg{dplyr}'s \code{arrange} function, select the top 6 using \code{slice}, and merge it with the original tidied data using \code{inner\_join}, to produce a plot of those genes and their rate-dependent expression:
+% 
+% \begin{center}
+% <<topgenes, dependson = "brauer_process">>=
+% topgenes <- coefs %>% arrange(p.value) %>% slice(1:6)
+% head(topgenes, 10)
+% 
+% merged <- topgenes %>% inner_join(brauer_tidied, by = c("gene", "nutrient"))
+% ggplot(merged, aes(rate, expression, group = gene)) + geom_line() +
+%     facet_wrap(~ nutrient, scales = "free_y")
+% @
+% \end{center}
+% 
+% These downstream analyses would have been equally straightforward even if the per-gene model were more complicated, such as a generalized linear model, an analysis of variance (ANOVA), a spline regression, or a nonlinear least squares fit, since \pkg{broom} provides tidying methods for each of these classes. Similarly, this output could be incorporated into other input-tidy tools, such as R's built-in plotting, or \CRANpkg{ggvis} for interactive visualizations \citep{package:ggvis}.
+
+\subsection{Bootstrapped confidence and prediction intervals}
+
+\label{sec:bootstrapping}
+
+Since tidy outputs can be recombined across replicates, it is also well suited to bootstrapping and permutation tests. Bootstrapping consists of randomly sampling observations from a dataset with replacement, then performing the same analysis individually on each bootstrapped replicate. The variation in the resulting value is then a reasonable approximation of the standard error of the estimate \citep{efron1994introduction}.
+
+Suppose we wish to fit a nonlinear model to the weight/mileage relationship in the \code{mtcars} dataset, which comes built-in to R.
+
+\begin{center}
+<<>>=
+ggplot(mtcars, aes(mpg, wt)) + geom_point()
+@
+\end{center}
+
+We might use the method of nonlinear least squares (the built-in \code{nls} function) to fit a model.
+
+\begin{center}
+<<nlsfit>>=
+nlsfit <- nls(mpg ~ k / wt + b, mtcars, start=list(k=1, b=0))
+summary(nlsfit)
+confint(nlsfit)
+ggplot(mtcars, aes(wt, mpg)) + geom_point() + geom_line(aes(y=predict(nlsfit)))
+@
+\end{center}
+
+While this does provide p-values and confidence intervals for the parameters, these are based on model assumptions that may not hold in real data. Bootstrapping is a popular method for providing confidence intervals and predictions that are more robust to the nature of the data.
+
+%For simplicity we define \code{resample} as a wrapper of \pkg{dplyr}'s \code{sample\_frac} that resamples a table's rows with replacement. Performing a single bootstrap replication is then simple.
+
+<<bootnls_skip, eval = FALSE, echo = FALSE>>=
+resample <- function(x) sample_frac(x, replace = TRUE)
+nlsfit_resamp <- nls(mpg ~ k / wt + b, resample(mtcars), start=list(k=1, b=0))
+@
+
+The \textbf{broom} package provides a \code{bootstrap} function that in combination with \pkg{dplyr} and a tidying method makes bootstrapping straightforward. \code{bootstrap(.data, B)} wraps a data table so that the next \code{do} step occurs $B$ times, each time operating on the data resampled with replacement. Within each of these \code{do} applications, we construct a tidied version of a nonlinear least squares fit.
+
+<<bootnls>>=
+set.seed(2014)
+bootnls <- mtcars %>% bootstrap(500) %>%
+    do(tidy(nls(mpg ~ k / wt + b, ., start=list(k=1, b=0))))
+@
+
+This produces a summary of the coefficients from each replication, combined into one data frame:
+
+<<dependson = "bootnls">>=
+head(bootnls)
+@
+
+We can then calculate confidence intervals by considering the quantiles of the bootstrapped estimates. This is often referred to as the percentile method of bootstrapping, though it is not the only way to construct a confidence interval from bootstrap replicates.
+
+<<confints, dependson = "bootnls">>=
+alpha = .05
+bootnls %>% group_by(term) %>%
+    summarize(conf.low = quantile(estimate, alpha / 2),
+              conf.high = quantile(estimate, 1 - alpha / 2))
+@
+
+% We can instead use histograms to get a more detailed idea of the uncertainty in each estimate:
+% 
+% \begin{center}
+% <<bootnls_figure1, dependson = "bootnls">>=
+% library(ggplot2)
+% 
+% ggplot(bootnls, aes(estimate)) + geom_histogram(binwidth = 2) +
+%     facet_wrap(~ term, scales="free")
+% @
+% \end{center}
+
+Finally, we can visualize the uncertainty in the actual curve using \code{augment} on each replication. We can then summarize the quantiles within each time point to produce bootstrap confidence intervals at each point.
+
+\begin{center}
+<<bootnls_figure, dependson = "bootnls">>=
+set.seed(2014)
+bootnls <- mtcars %>% bootstrap(500) %>%
+    do(augment(nls(mpg ~ k / wt + b, ., start=list(k=1, b=0)), .))
+alpha = .05
+bootnls_bytime <- bootnls %>% group_by(wt) %>%
+    summarize(conf.low = quantile(.fitted, alpha / 2),
+              conf.high = quantile(.fitted, 1 - alpha / 2),
+              median = median(.fitted))
+head(bootnls_bytime)
+ggplot(mtcars, aes(wt)) + geom_point(aes(y = mpg)) +
+    geom_line(aes(y = .fitted), data = augment(nlsfit)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), data = bootnls_bytime, alpha = .1)
+@
+\end{center}
+
+This bootstrapping approach could be applied to any prediction function for which an \code{augment} method is defined. For example, we could use the built-in \pkg{splines} package to predict the curve using a natural cubic spline basis.
+
+<<bootspline, dependson = "bootnls_figure">>=
+library(splines)
+bootspline <- mtcars %>% bootstrap(500) %>%
+    do(augment(lm(mpg ~ ns(wt, 4), .), .))
+@
+
+Since the bootstrap results are in the same format as the NLS fit, it is easy to combine them and then compare them on the same axis.
+
+<<boot_compare, dependson = c("bootspline", "bootnls_figure")>>=
+bootnls$method <- "nls"
+bootspline$method <- "spline"
+allboot <- rbind_list(bootnls, bootspline)
+allboot_bywt <- allboot %>% group_by(wt, method) %>%
+    summarize(conf.low = quantile(.fitted, alpha / 2),
+              conf.high = quantile(.fitted, 1 - alpha / 2),
+              median = median(.fitted))
+ggplot(allboot_bywt, aes(wt, median, color = method)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), lty = 2, alpha = .1)
+@
+
+Bootstrapping can be applied in this way to any object that \pkg{broom} can tidy, such as survival models from the \pkg{survival} package. Here we consider the \code{lung} dataset, which records the survival of patients with advanced lung cancer over time. We use the \code{coxph} function to fit a Cox proportional hazards regression model to model the likelihood of survival based on the demographic features of age and sex, and use \code{survfit} to construct a survival curve based on these hazards \citep{Therneau:2000tk}. Just like we did on the \code{mtcars} dataset, we perform this analysis within each of 500 bootstrap resamplings of the dataset. 
+
+<<survival_bootstrap>>=
+library(survival)
+bootstraps_survival <- lung %>% bootstrap(500) %>%
+    do(tidy(survfit(coxph(Surv(time, status) ~ age + sex, .))))
+head(bootstraps_survival)
+@
+
+We can then construct and visualize a confidence interval for the fraction of survival at each time point, just as we did for the NLS and spline fits.
+
+\begin{center}
+<<survival_bootstrap_curve, dependson = "survival_bootstrap">>=
+alpha = .05
+bootstraps_bytime <- bootstraps_survival %>% group_by(time) %>%
+    summarize(conf.low = quantile(estimate, alpha / 2),
+              conf.high = quantile(estimate, 1 - alpha / 2),
+              estimate = median(estimate))
+
+ggplot(bootstraps_bytime, aes(time, estimate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), lty = 2, alpha = .2)
+@
+\end{center}
+
+It is worth noting that the tidy approach to bootstrapping may not necessarily be the most computationally efficient option for all modeling approaches. Some bootstrapping problems can be simplified to matrix operations that allow more very efficient processing and storage. Framing bootstrapping as a problem of recombining many tidy outputs is useful, however, for its simplicity and universality, as these same idioms can be applied to bootstrap any model with \code{tidy} or \code{augment} methods.
+
+\subsection{Simulation of k-means clustering}
+
+\label{sec:kmeans}
+
+Because the \pkg{broom} package makes it possible to recombine many analyses, it is also well suited to simulation for the purpose of exploring a method's behavior and robustness. Tidied model outputs can easily be recombined across varying input parameters, or across simulation replications, and lend themselves to downstream analysis and visualization. In this simulation we examine a k-means clustering problem, and observe how the results are affected by the choice of the number of clusters and by the within-cluster variation in the data.
+
+K-means clustering divides a set of points in an $n$-dimensional space into $k$ centers by assigning each point to the cluster with the nearest of $k$ designated centers. This is well suited for clustering problems where the data is assumed to be approximately multivariate Gaussian distributed around each cluster. The \pkg{stats} package provides an implementation of k-means clustering (based, by default, on the algorithm of \citet{HartiganWong:1979}), which requires the choice of $k$ to be made beforehand.
+
+We start by exploring the effect of the choice of $k$ on the behavior of the clustering algorithm. We first generate random 2-dimensional data with three centers, around which points are distributed according to a standard multivariate Gaussian distribution:
+
+<<kmeans_sim>>=
+set.seed(2014)
+centers <- data.frame(oracle = factor(1:3),
+                      size = c(100, 150, 50),
+                      x1 = c(5, 0, -3),
+                      x2 = c(-1, 1, -2))
+kdat <- centers %>%
+    group_by(oracle) %>%
+    do(data.frame(x1 = rnorm(.$size[1], .$x1[1]),
+                  x2 = rnorm(.$size[1], .$x2[1])))
+@
+
+Now suppose we would like to perform k-means clustering on this data, while varying the number of clusters $k$. The \code{inflate} function, provided by \pkg{broom}, is useful for this purpose: it expands a dataset to repeat its original data once for each factorial combination of parameters.
+
+<<inflate_example>>=
+d <- data.frame(a = 1:3, b = 8:10)
+d %>% inflate(x = c("apple", "orange"), y = c("car", "boat"))
+@
+
+In this case, we perform clustering on the same data (\code{kdat}) with each value of $k$ in \code{1:9}. Note that to reduce the role of randomness in the clustering process, we set \code{nstart = 5} to the \code{kmeans} function.
+
+<<kmeans_run, dependson = "kmeans_sim">>=
+kclusts <- kdat %>% inflate(k = 1:9) %>% group_by(k) %>%
+    do(clust = kmeans(select(., x1, x2), .$k[1], nstart = 5))
+kclusts
+@
+
+There are three levels at which we can examine a k-means clustering. As is true of regressions and other statistical models, each of these levels describes a separate observational unit, and therefore is extracted by a different \pkg{broom} generic.
+
+\begin{itemize}
+\item \textbf{Component level}: The centers, size, and within sum-of-squares for each cluster; computed by \code{tidy}
+\item \textbf{Observation level}: The assignment of each point to a cluster; computed by \code{augment}
+\item \textbf{Model level}: The total within sum-of-squares and between sum-of-squares; computed by \code{glance}
+\end{itemize}
+
+We extract tidied versions of these three levels from each of the 9 clustering objects produced in the simulation, then recombine each level into a single large table containing the results for all values of $k$. We use the shortcut for performing tidying functions on a rowwise table first demonstrated in \nameref{sec:split_apply_combine}.
+
+<<kmeans_TAG, dependson="kmeans_run">>=
+clusters <- kclusts %>% tidy(clust)
+assignments <- kclusts %>% augment(clust, kdat)
+clusterings <- kclusts %>% glance(clust)
+@
+
+The \code{assignments} object, generated using the \code{augment} method on each clustering, combines the cluster assignments across all values of $k$, thus allowing for simple visualization using faceting.
+
+\begin{center}
+<<kmeans_assignments, dependson = "kmeans_TAG">>=
+head(assignments)
+p1 <- ggplot(assignments, aes(x1, x2)) +
+    geom_point(aes(color = .cluster, shape = oracle)) +
+    facet_wrap(~ k)
+p1
+@
+\end{center}
+
+We can use the results from the \code{tidy} outputs, which provide per-cluster information, to add the estimated center of each cluster to the plot.
+
+\begin{center}
+<<kmeans_points, dependson = "kmeans_TAG">>=
+p2 <- p1 + geom_point(data = clusters, size = 10, shape = "x")
+p2
+@
+\end{center}
+
+Finally, we can examine the per-model data using the \code{glance} outputs. Of particular interest is the total within cluster sum-of-squares. The decrease in this within-cluster variation as clusters are added to the model can serve as a criterion for choosing $k$.
+
+\begin{center}
+<<kmeans_twss, dependson = "kmeans_TAG">>=
+ggplot(clusterings, aes(k, tot.withinss)) + geom_line()
+@
+\end{center}
+
+The variance within each estimated cluster decreases as k increases, but one can notice a bend (or “elbow”) around the correct value of $k=3$. This bend indicates that additional clusters beyond the third have little value in terms of explaining the variation in the data. \citet{Tibshirani:2002fj} provides a more mathematically rigorous interpretation and implementation of a method to choose $k$ based on this profile. Note that all three methods of tidying data provided by \pkg{broom} play a separate role in visualization and analysis of these simulations.
+
+While a simulation varying $k$ is useful, we may also be interested in how robust the algorithm is when the original data is altered. For example, the points around each center are generated from a multivariate normal distribution with standard deviation $\sigma=1$. If this standard deviation increases, making the cloud of points around each center more disperse, we would expect k-means clustering to be less accurate. We also wish to know the role of random variation, and therefore will perform 50 replicates of each simulation. These goals can be achieved with some small modifications to the previous simulation. We first generate the data using the same centers, but with multiple values of $\sigma$ and multiple independent replications:
+
+<<kdat_sd, dependson = "kdat">>=
+set.seed(2014)
+kdat_sd <- centers %>%
+    inflate(sd = c(.5, 1, 2, 4), replication = 1:50) %>%
+    group_by(oracle, sd, replication) %>%
+    do(data.frame(x1 = rnorm(.$size[1], .$x1[1], .$sd[1]),
+                  x2 = rnorm(.$size[1], .$x2[1], .$sd[1])))
+@
+
+We perform k-means clustering 9 times on each dataset, choosing a different value of $k$ each time. We then extract the tidied, augmented, and glanced forms, which in this case are combined across all factorial combinations of \code{k}, \code{sd}, and \code{replication}. One could easily extend the simulation to alter other parameters such as the number and distribution of true cluster centers, or the \code{nstart} parameter.
+
+<<kclust_sd, dependson = "kdat_sd">>=
+kclusts_sd <- kdat_sd %>% inflate(k = 1:9) %>% group_by(k, sd, replication) %>%
+    do(dat = (.), clust = kmeans(select(., x1, x2), .$k[1], nstart = 5))
+clusters_sd <- kclusts_sd %>% tidy(clust)
+glances_sd <- kclusts_sd %>% glance(clust)
+assignments_sd <- kclusts_sd %>% group_by(k, sd, replication) %>%
+    do(augment(.$clust[[1]], .$dat[[1]]))
+@
+
+(Note that since the \code{augment} operation requires the original data, which changes in each replication, we needed a different approach to perform \code{augment} on each row). One interesting question is whether the cluster centers were estimated accurately in each simulation. The estimated centers are included in the recombined \code{tidy} output, which can be visualized alongside the true centers (red X's) separately for each value of $\sigma$:
+
+\begin{center}
+<<estimated_centers, dependson = "kclust_sd">>=
+clusters_sd %>% filter(k == 3) %>%
+    ggplot(aes(x1, x2)) + geom_point() +
+    geom_point(data = centers, size = 7, color = "red", shape = "x") +
+    facet_wrap(~ sd)
+@
+\end{center}
+
+We can see that the centers are estimated very accurately for $\sigma = .5$ and $1$, less accurately for $\sigma = 2$, and rather inaccurately for $\sigma = 4$. Also notably, the center estimates for $\sigma = 4$ are systematically biased  "outward" for two of the three clusters, as an artifact of the greater variation.
+
+We can also see how the total within-sum-of-squares graph appears across all replications, and how it varies when changing the value of $\sigma$.
+
+\begin{center}
+<<totwithinss_sd, dependson = "kclust_sd">>=
+ggplot(glances_sd, aes(k, tot.withinss, group = replication)) +
+    geom_line() + facet_wrap(~ sd, scales = "free_y")
+@
+\end{center}
+
+We can observe from this that the choice of $k$ based on the total within sum-of-squares profile becomes more difficult as $\sigma$ increases, since the bend at $k=3$ becomes less distinct. We could even measure the cluster purity, and see how the classification accuracy depends on $\sigma$, focusing on the cases where we (correctly) set $k=3$. This requires some processing but can be done entirely in \pkg{dplyr} operations.
+
+\begin{center}
+<<purities_sd, dependson = "kclust_sd">>=
+accuracies <- assignments_sd %>% filter(k == 3) %>%
+    count(replication, sd, oracle, .cluster) %>%
+    group_by(replication, sd, .cluster) %>%
+    summarize(correct = max(n), total = sum(n)) %>%
+    group_by(replication, sd) %>%
+    summarize(purity = sum(correct) / sum(total))
+ggplot(accuracies, aes(factor(sd), purity)) + geom_boxplot()
+@
+\end{center}
+
+We can see that, as one might expect, the classification accuracy decreases on average as the residual standard deviation increases and the clusters get more disperse. These examples demonstrate that combining the models from simulations into a tidied form thus lends itself well to many kinds of exploratory analyses and experiments.
+
+% \subsection{Visualizing, comparing and bootstrapping survival curves}
+% 
+% The \pkg{broom} package also provides tidying methods for several popular third party packages. One example of this is the \pkg{survival} package, which provides methods for survival analysis. Here we show how the approaches for visualization, simulation, and bootstrapping discussed in previous sections can be applied to enrich a survival analysis.
+% 
+% The \pkg{survival} package provides the \code{lung} dataset, which records the survival of patients with advanced lung cancer over time. We use the \code{coxph} function to fit a Cox proportional hazards regression model to model the likelihood of survival based on the demographic features of age and sex, and use \code{survfit} to construct a survival curve based on these hazards \citep{Therneau:2000tk}.
+% 
+% <<survival>>=
+% library(survival)
+% coxfit <- coxph(Surv(time, status) ~ age + sex, lung)
+% sfit <- survfit(coxfit)
+% @
+% 
+% \pkg{broom} contains tidying methods for both the proportional hazards model and the resulting survival curve fit. The tidied version of the proportional hazards model contains the estimates and significance of each term in the regression, while the tidied survival curve constructs one row for each time point in the model and estimates the survival rate at that point.
+% 
+% <<dependson = "survival">>=
+% tidy(coxfit)
+% head(tidy(sfit))
+% @
+% 
+% While the \pkg{survival} package provides a \code{plot.survfit} method, \pkg{broom}'s tidying method is well suited for producing a data frame that can be plotted in \pkg{ggplot2}.
+% 
+% \begin{center}
+% <<survival_plot, dependson = "survival">>=
+% library(ggplot2)
+% ggplot(tidy(sfit), aes(time, estimate)) + geom_line() +
+%     geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .2)
+% @
+% \end{center}
+% 
+% Using \pkg{ggplot2} on the tidied version rather than the built-in plotting method lets us make decisions about the values that are calculated and displayed, and to take advantage of \pkg{ggplot2}'s ability to combine, layer and facet plots intuitively. For example,  \code{survfit} offers three ways to compute confidence intervals. Using the \code{inflate} function introduced in \nameref{sec:kmeans}, we can combine tidied versions of those three methods and compare them visually.
+% 
+% \begin{center}
+% <<coxph_confint, dependson = "survival">>=
+% survfits <- lung %>%
+%     inflate(conf.type = c("plain", "log", "log-log")) %>%
+%     do(tidy(survfit(coxph(Surv(time, status) ~ age + sex, .),
+%                     conf.type = .$conf.type[1])))
+% 
+% ggplot(survfits, aes(time, estimate)) + geom_line() +
+%     geom_ribbon(aes(ymin = conf.low, ymax = conf.high, color = conf.type),
+%                 alpha = .1)
+% @
+% \end{center}
+% 
+% Alternatively, we may prefer to compute confidence intervals using bootstrapping rather than a parametric approach. Similar to the approach in \nameref{sec:bootstrapping}, we generate 500 curves from bootstrap resamplings of the data, then summarize to find the $2.5\%$ and $97.5\%$ quantile points at each time point.
+% 
+% \begin{center}
+% <<survival_bootstrap, dependson = "survival">>=
+% bootstraps <- lung %>% bootstrap(500) %>%
+%     do(tidy(survfit(coxph(Surv(time, status) ~ age + sex, .))))
+% 
+% alpha = .05
+% bootstraps_bytime <- bootstraps %>% group_by(time) %>%
+%     summarize(conf.low = quantile(estimate, alpha / 2),
+%               conf.high = quantile(estimate, 1 - alpha / 2),
+%               estimate = median(estimate))
+% head(bootstraps_bytime)
+% @
+% \end{center}
+% 
+% We can then combine it with the parametrically computed confidence intervals and compare them in the same plot.
+% 
+% \begin{center}
+% <<>>=
+% bootstraps_bytime$conf.type = "bootstrap"
+% survfits <- rbind_list(survfits, bootstraps_bytime)
+% 
+% ggplot(survfits, aes(time, estimate, color = conf.type)) +
+%     geom_line() +
+%     geom_ribbon(aes(ymin = conf.low, ymax = conf.high), lty = 2, alpha = .1)
+% @
+% \end{center}
+% 
+% By tidying the survival model into a consistent format, \textbf{broom} thus allows the user to construct novel visualizations, compare across models or settings, and construct confidence intervals using bootstrapping. A similar approach could be used with many of the other analysis methods that \pkg{broom} can tidy.
+
+\section{Discussion}
+
+In this paper I introduce the \pkg{broom} package, define the \code{tidy}, \code{augment}, and \code{glance} generics, and describe standards for their behavior. I then provide case studies that illustrate how the tidied outputs that \textbf{broom} creates are useful in a variety of analyses and simulation. The examples listed here are by no means meant to be exhaustive, and indeed make use of only a minority of the tidying methods implemented by \pkg{broom}. Rather, they are meant to suggest the diversity of visualizations and analyses made possible by tidied model outputs.
+
+While \pkg{broom} provides implementations of these generics for many popular R objects, there is no reason that such implementations should be confined to this package. In the future, packages that wish to be output-tidy while retaining the structure of their output object could provide their own \code{tidy}, \code{augment}, and \code{glance} implementations. This would take advantage of each developer's familiarity with his or her software and its goals while offering users a standard tidying language for working with model outputs.
+
+Tidying model outputs is not an exact science, and it is based on a judgment of the kinds of values a data scientist typically wants out of a tidy analysis (for instance, estimates, test statistics, and p-values). Any implementation may lose some of the information that a user wants or keep more information than one needs. It is my hope that data scientists will propose and contribute their own features to expand and improve the functionality of \pkg{broom} and to advance the entire available suite of tidy tools.
+
+\section{Acknowledgments}
+
+I thank Andy Bass, Dmitry Gorenshteyn, and Bob Muenchen for helpful comments and discussions on this manuscript. I thank Hadley Wickham for comments early in \pkg{broom}'s development and for contributing code from \pkg{ggplot2} to the package, and thank Matthieu Gomez and Boris Demeshev for contributions to the software.
+
+This work was supported in part by NIH (R01 HG002913).
+
+\bibliography{RJreferences}
+
+\address{David Robinson\\
+  Princeton University\\
+  Carl Icahn Laboratory, Washington Road, Princeton, NJ 08544\\
+  United States}
+\email{admiral.david@gmail.com}
+
+<<save_session_info, include = FALSE, dependson = c("survival_bootstrap_curve", "purities_sd", "regressions_plot")>>=
+{
+    sink('sessionInfo.txt')
+    print(sessionInfo())
+    sink()
+}
+@
